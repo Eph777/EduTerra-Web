@@ -14,11 +14,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Serve the EduTerra whiteboard page over HTTPS with nginx.
+# Serve the EduTerra whiteboard page with nginx.
 # Usage: sudo ./setup-whiteboard.sh
-#   Prompts for the port and a domain name. With a domain, a trusted
-#   Let's Encrypt certificate is obtained and renewed automatically.
-#   Without one, a self-signed certificate is generated.
+#   Behind a proxy that already handles HTTPS (e.g. Caddy), nginx serves
+#   plain HTTP. Otherwise nginx serves HTTPS itself: with a domain, a trusted
+#   Let's Encrypt certificate is obtained and renewed automatically; without
+#   one, a self-signed certificate is generated.
 # The page is copied to /var/www/eduterra-whiteboard: re-run the script
 # after editing it to publish the new version.
 set -euo pipefail
@@ -33,12 +34,27 @@ NAME="eduterra-whiteboard"
 WEB_ROOT="/var/www/$NAME"
 SITE="/etc/nginx/sites-available/$NAME"
 SERVER_IP="$(hostname -I | awk '{print $1}')"
+DOMAIN=""
 
-read -rp "Port for the whiteboard [443]: " PORT
-PORT="${PORT:-443}"
-read -rp "Domain name pointing to this server (leave empty for a self-signed certificate): " DOMAIN
-if [ -n "$DOMAIN" ]; then
-    read -rp "Email for Let's Encrypt expiry notices: " EMAIL
+read -rp "Is HTTPS already handled by a proxy in front of this server, e.g. Caddy? [y/N]: " ANSWER
+if [[ "$ANSWER" =~ ^[Yy] ]]; then PROXY=1; DEFAULT_PORT=80; else PROXY=""; DEFAULT_PORT=443; fi
+
+read -rp "Port for the whiteboard [$DEFAULT_PORT]: " PORT
+PORT="${PORT:-$DEFAULT_PORT}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    echo "Invalid port: $PORT" >&2
+    exit 1
+fi
+if [ -z "$PROXY" ] && [ "$PORT" -eq 80 ]; then
+    echo "Port 80 is reserved for the HTTP redirect and Let's Encrypt, choose another" >&2
+    exit 1
+fi
+
+if [ -z "$PROXY" ]; then
+    read -rp "Domain name pointing to this server (leave empty for a self-signed certificate): " DOMAIN
+    if [ -n "$DOMAIN" ]; then
+        read -rp "Email for Let's Encrypt expiry notices: " EMAIL
+    fi
 fi
 
 # Remove the previous Python-based setup, if any (it holds the port)
@@ -60,10 +76,12 @@ install -m 644 "$SRC_DIR/EduTerraWhiteboard.html" "$WEB_ROOT/index.html"
 # Only touches the firewall if ufw is installed
 if command -v ufw >/dev/null; then
     ufw allow "$PORT/tcp"
-    ufw allow 80/tcp
+    [ -z "$PROXY" ] && ufw allow 80/tcp
 fi
 
-if [ -n "$DOMAIN" ]; then
+if [ -n "$PROXY" ]; then
+    URL="http://$SERVER_IP"
+elif [ -n "$DOMAIN" ]; then
     CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 
@@ -91,30 +109,39 @@ else
     URL="https://$SERVER_IP"
 fi
 
-[ "$PORT" != 443 ] && URL="$URL:$PORT"
-
-cat > "$SITE" <<EOF
-# Redirect plain HTTP to HTTPS
+if [ -n "$PROXY" ]; then
+    [ "$PORT" != 80 ] && URL="$URL:$PORT"
+    REDIRECT=""
+    LISTEN="    listen ${PORT};
+    listen [::]:${PORT};"
+else
+    [ "$PORT" != 443 ] && URL="$URL:$PORT"
+    REDIRECT="# Redirect plain HTTP to HTTPS
 server {
     listen 80;
     listen [::]:80;
     return 301 ${URL}\$request_uri;
 }
-
-server {
-    listen ${PORT} ssl;
+"
+    LISTEN="    listen ${PORT} ssl;
     listen [::]:${PORT} ssl;
 
     ssl_certificate     ${CERT_FILE};
     ssl_certificate_key ${KEY_FILE};
     ssl_protocols       TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security \"max-age=31536000\";"
+fi
+
+cat > "$SITE" <<EOF
+${REDIRECT}
+server {
+${LISTEN}
 
     root ${WEB_ROOT};
     index index.html;
     server_tokens off;
 
     add_header Cache-Control "no-cache";
-    add_header Strict-Transport-Security "max-age=31536000";
     add_header X-Content-Type-Options "nosniff";
 
     location / {
@@ -131,6 +158,11 @@ nginx -t
 systemctl enable nginx
 systemctl restart nginx
 
-echo "Whiteboard hosted at: $URL/"
+if [ -n "$PROXY" ]; then
+    echo "Whiteboard served over plain HTTP at: $URL/"
+    echo "  Point your proxy (e.g. Caddy: reverse_proxy $SERVER_IP:$PORT) to this address"
+else
+    echo "Whiteboard hosted at: $URL/"
+fi
 echo "  Status: systemctl status nginx"
 echo "  Logs:   tail -f /var/log/nginx/access.log /var/log/nginx/error.log"
