@@ -14,14 +14,13 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Install a systemd service hosting the EduTerra whiteboard page over HTTPS.
+# Serve the EduTerra whiteboard page over HTTPS with nginx.
 # Usage: sudo ./setup-whiteboard.sh
 #   Prompts for the port and a domain name. With a domain, a trusted
 #   Let's Encrypt certificate is obtained and renewed automatically.
 #   Without one, a self-signed certificate is generated.
-# The app is copied to /opt/eduterra-whiteboard and runs as a dedicated
-# system user, so the repo can live anywhere (even /root). Re-run the
-# script after editing the page to publish the new version.
+# The page is copied to /var/www/eduterra-whiteboard: re-run the script
+# after editing it to publish the new version.
 set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
@@ -30,12 +29,10 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_NAME="eduterra-whiteboard"
-SERVICE_USER="$SERVICE_NAME"
-APP_DIR="/opt/$SERVICE_NAME"
+NAME="eduterra-whiteboard"
+WEB_ROOT="/var/www/$NAME"
+SITE="/etc/nginx/sites-available/$NAME"
 SERVER_IP="$(hostname -I | awk '{print $1}')"
-CERT_FILE="$APP_DIR/certs/cert.pem"
-KEY_FILE="$APP_DIR/certs/key.pem"
 
 read -rp "Port for the whiteboard [443]: " PORT
 PORT="${PORT:-443}"
@@ -44,74 +41,96 @@ if [ -n "$DOMAIN" ]; then
     read -rp "Email for Let's Encrypt expiry notices: " EMAIL
 fi
 
-# Dedicated user with no login and no home, owning only the certs
-id -u "$SERVICE_USER" >/dev/null 2>&1 || \
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+# Remove the previous Python-based setup, if any (it holds the port)
+if [ -f "/etc/systemd/system/$NAME.service" ]; then
+    systemctl disable --now "$NAME" || true
+    rm -f "/etc/systemd/system/$NAME.service"
+    systemctl daemon-reload
+fi
+rm -rf "/opt/$NAME" "/etc/letsencrypt/renewal-hooks/deploy/$NAME.sh"
+id -u "$NAME" >/dev/null 2>&1 && userdel "$NAME"
 
-install -d -m 755 "$APP_DIR"
-install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/certs"
-install -m 644 "$SRC_DIR/whiteboard_server.py" "$SRC_DIR/EduTerraWhiteboard.html" "$APP_DIR/"
+apt-get update
+apt-get install -y nginx
+[ -n "$DOMAIN" ] && apt-get install -y certbot
 
-cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
-[Unit]
-Description=EduTerra Whiteboard HTTPS Server (port ${PORT})
-After=network.target
-
-[Service]
-User=${SERVICE_USER}
-ExecStart=/usr/bin/python3 ${APP_DIR}/whiteboard_server.py ${PORT} --cert ${CERT_FILE} --key ${KEY_FILE}
-Restart=always
-# Allows ports below 1024 (e.g. 443) without running as root
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
+install -d -m 755 "$WEB_ROOT"
+install -m 644 "$SRC_DIR/EduTerraWhiteboard.html" "$WEB_ROOT/index.html"
 
 # Only touches the firewall if ufw is installed
-HAS_UFW=$(command -v ufw || true)
-[ -n "$HAS_UFW" ] && ufw allow "${PORT}/tcp"
+if command -v ufw >/dev/null; then
+    ufw allow "$PORT/tcp"
+    ufw allow 80/tcp
+fi
 
 if [ -n "$DOMAIN" ]; then
-    command -v certbot >/dev/null || { apt-get update && apt-get install -y certbot; }
+    CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 
-    # Let's Encrypt checks domain ownership over port 80 (now and at each renewal)
-    [ -n "$HAS_UFW" ] && ufw allow 80/tcp
+    # Let's Encrypt verifies the domain on port 80, which nginx also uses:
+    # pause nginx for those few seconds, now and at each renewal
+    mkdir -p /etc/letsencrypt/renewal-hooks/{pre,post}
+    printf '#!/bin/sh\nsystemctl stop nginx\n'  > /etc/letsencrypt/renewal-hooks/pre/nginx.sh
+    printf '#!/bin/sh\nsystemctl start nginx\n' > /etc/letsencrypt/renewal-hooks/post/nginx.sh
+    chmod +x /etc/letsencrypt/renewal-hooks/{pre,post}/nginx.sh
 
-    # Renewal hook: the service doesn't run as root, so it can't read
-    # /etc/letsencrypt; copy the cert into the app folder and restart it
-    HOOK="/etc/letsencrypt/renewal-hooks/deploy/${SERVICE_NAME}.sh"
-    mkdir -p "$(dirname "$HOOK")"
-    cat > "$HOOK" <<EOF
-#!/bin/sh
-cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${CERT_FILE}
-cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${KEY_FILE}
-chown ${SERVICE_USER}: ${CERT_FILE} ${KEY_FILE}
-chmod 600 ${KEY_FILE}
-systemctl try-restart ${SERVICE_NAME}
-EOF
-    chmod +x "$HOOK"
-
-    certbot certonly --standalone --non-interactive --agree-tos \
-        -d "$DOMAIN" -m "$EMAIL"
-    "$HOOK"
-    URL="https://${DOMAIN}:${PORT}/"
+    systemctl stop nginx
+    certbot certonly --standalone --non-interactive --agree-tos -d "$DOMAIN" -m "$EMAIL"
+    URL="https://$DOMAIN"
 else
+    CERT_FILE="/etc/nginx/ssl/$NAME.crt"
+    KEY_FILE="/etc/nginx/ssl/$NAME.key"
     if [ ! -f "$CERT_FILE" ]; then
         echo "Generating self-signed certificate for $(hostname) / $SERVER_IP..."
+        install -d -m 700 /etc/nginx/ssl
         openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
             -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$(hostname)" \
             -addext "subjectAltName=DNS:$(hostname),DNS:localhost,IP:$SERVER_IP,IP:127.0.0.1"
-        chown "$SERVICE_USER:" "$CERT_FILE" "$KEY_FILE"
         chmod 600 "$KEY_FILE"
     fi
-    URL="https://${SERVER_IP}:${PORT}/"
+    URL="https://$SERVER_IP"
 fi
 
-systemctl enable ${SERVICE_NAME}
-systemctl restart ${SERVICE_NAME}
+[ "$PORT" != 443 ] && URL="$URL:$PORT"
 
-echo "Whiteboard hosted at: ${URL}"
-echo "  Status: systemctl status ${SERVICE_NAME}"
-echo "  Logs:   journalctl -u ${SERVICE_NAME} -f"
+cat > "$SITE" <<EOF
+# Redirect plain HTTP to HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    return 301 ${URL}\$request_uri;
+}
+
+server {
+    listen ${PORT} ssl;
+    listen [::]:${PORT} ssl;
+
+    ssl_certificate     ${CERT_FILE};
+    ssl_certificate_key ${KEY_FILE};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root ${WEB_ROOT};
+    index index.html;
+    server_tokens off;
+
+    add_header Cache-Control "no-cache";
+    add_header Strict-Transport-Security "max-age=31536000";
+    add_header X-Content-Type-Options "nosniff";
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+
+# Replace nginx's default welcome site with this one
+rm -f /etc/nginx/sites-enabled/default
+ln -sf "$SITE" "/etc/nginx/sites-enabled/$NAME"
+
+nginx -t
+systemctl enable nginx
+systemctl restart nginx
+
+echo "Whiteboard hosted at: $URL/"
+echo "  Status: systemctl status nginx"
+echo "  Logs:   tail -f /var/log/nginx/access.log /var/log/nginx/error.log"
