@@ -19,6 +19,9 @@
 #   Prompts for the port and a domain name. With a domain, a trusted
 #   Let's Encrypt certificate is obtained and renewed automatically.
 #   Without one, a self-signed certificate is generated.
+# The app is copied to /opt/eduterra-whiteboard and runs as a dedicated
+# system user, so the repo can live anywhere (even /root). Re-run the
+# script after editing the page to publish the new version.
 set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
@@ -26,12 +29,13 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_USER="${SUDO_USER:-root}"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="eduterra-whiteboard"
+SERVICE_USER="$SERVICE_NAME"
+APP_DIR="/opt/$SERVICE_NAME"
 SERVER_IP="$(hostname -I | awk '{print $1}')"
-CERT_FILE="$DIR/certs/cert.pem"
-KEY_FILE="$DIR/certs/key.pem"
+CERT_FILE="$APP_DIR/certs/cert.pem"
+KEY_FILE="$APP_DIR/certs/key.pem"
 
 read -rp "Port for the whiteboard [443]: " PORT
 PORT="${PORT:-443}"
@@ -40,7 +44,13 @@ if [ -n "$DOMAIN" ]; then
     read -rp "Email for Let's Encrypt expiry notices: " EMAIL
 fi
 
-mkdir -p "$DIR/certs"
+# Dedicated user with no login and no home, owning only the certs
+id -u "$SERVICE_USER" >/dev/null 2>&1 || \
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+
+install -d -m 755 "$APP_DIR"
+install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/certs"
+install -m 644 "$SRC_DIR/whiteboard_server.py" "$SRC_DIR/EduTerraWhiteboard.html" "$APP_DIR/"
 
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
@@ -49,7 +59,7 @@ After=network.target
 
 [Service]
 User=${SERVICE_USER}
-ExecStart=/usr/bin/python3 ${DIR}/whiteboard_server.py ${PORT} --cert ${CERT_FILE} --key ${KEY_FILE}
+ExecStart=/usr/bin/python3 ${APP_DIR}/whiteboard_server.py ${PORT} --cert ${CERT_FILE} --key ${KEY_FILE}
 Restart=always
 # Allows ports below 1024 (e.g. 443) without running as root
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -70,7 +80,7 @@ if [ -n "$DOMAIN" ]; then
     [ -n "$HAS_UFW" ] && ufw allow 80/tcp
 
     # Renewal hook: the service doesn't run as root, so it can't read
-    # /etc/letsencrypt; copy the cert next to the app and restart it
+    # /etc/letsencrypt; copy the cert into the app folder and restart it
     HOOK="/etc/letsencrypt/renewal-hooks/deploy/${SERVICE_NAME}.sh"
     mkdir -p "$(dirname "$HOOK")"
     cat > "$HOOK" <<EOF
